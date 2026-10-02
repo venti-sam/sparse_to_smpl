@@ -1,8 +1,8 @@
-# AMASS → VR Full-Body Pose Estimation
+# sparse_to_smpl
 
-Trains a Transformer that predicts a 22-joint SMPL body from 6 VR trackers (pelvis, both ankles, head, both hands). Used by the live pipeline in `htc_vive_pro2_socket` to feed GMR.
+Sparse-to-dense body pose for VR teleoperation: a causal transformer that predicts a full 22-joint SMPL body from 6 VR trackers (pelvis, both ankles, head, both hands). It is trained on motion capture (AMASS and BONES-SEED) with simulated Vive trackers, and feeds the live pipeline in `htc_vive_pro2_socket`, which retargets the body to the G1.
 
-Everything below runs **inside the Docker container** from `/workspace/amass/src` unless noted.
+Everything below runs **inside the Docker container** from `/workspace/amass/src` unless noted. (The image and container keep their original names `amass_env` / `amass_container`, and the repo is mounted at `/workspace/amass` inside it.)
 
 ## 0. Prerequisites
 

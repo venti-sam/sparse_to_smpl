@@ -1,0 +1,9 @@
+# The image does not copy the repo (it is bind-mounted), so keep the build context tiny.
+.git
+support_data
+checkpoints*
+all_data_ckpt
+src/wandb
+**/__pycache__
+*.pt
+*.ckpt
