@@ -1,11 +1,9 @@
-"""
-Loss functions v4 — with Hierarchical Rotation Loss and MPJPE metric.
-"""
+"""Pose loss (FK position + hierarchical 6D rotation + velocity) and the MPJPE metric."""
 
 import torch
 import torch.nn as nn
 
-from .model import rotmat_to_sixd
+from .rotations import rotmat_to_sixd
 
 
 class BodyPoseLoss(nn.Module):

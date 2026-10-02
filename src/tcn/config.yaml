@@ -1,10 +1,26 @@
 data:
-  dataset_dir: ../support_data/vr_teleop_dataset_v2  # from src/convert_dataset_v2.py
+  # Memory-mapped mix of AMASS + BONES-SEED (+ LAFAN1 for testing), built by src/build_store.py.
+  # AMASS-only training: drop the BONES set and BONES groups from `train` below.
+  store_dir: ../support_data/store_v2
   window_size: 40
-  train_split: 0.9 # Fallback if folders not used
-  train_folders: ["CMU", "KIT", "BMLrub", "BMLmovi", "PosePrior"]
-  val_folders: ["SFU", "HDM05"]
-  test_folders: ["SSM"]
+  samples_per_epoch: 2000000   # random windows per "epoch"
+  eval_stride: 30              # val/test windows: every 30th start
+  train:
+    sets:
+      - {source: AMASS, folders: [CMU, KIT, BMLrub, BMLmovi, PosePrior]}
+      - {source: BONES, split: train}      # BONES is split by actor (90/5/5)
+    mix:                                   # share of training windows per group
+      amass: 0.4
+      bones_std: 0.3
+      bones_low: 0.3                       # sitting, crouching, kneeling, crawling, lying, handstands
+  val:
+    amass_val: {source: AMASS, folders: [SFU, HDM05]}
+    bones_val: {source: BONES, split: val}
+  test:
+    amass_test: {source: AMASS, folders: [SSM]}
+    bones_test: {source: BONES, split: test}
+    lafan1: {source: LAFAN1}
+
   augmentation:
     enabled: true
     pos_jitter_std: 0.0015  # per-frame sensor jitter (m)
@@ -16,6 +32,7 @@ data:
     dropout_frames: [5, 30] # freeze duration range (frames at 60 Hz)
     bone_scale_global: 0.15   # body size x U(0.85, 1.15), inputs and targets
     bone_scale_limb_std: 0.05 # per-bone lognormal jitter (left/right shared)
+    mirror_prob: 0.5          # random left-right mirror of the whole window (train only)
     # Vive mounting. Each tracker is rigid on a body joint; offsets are in that
     # joint's local frame (x forward, y left, z up), metres / degrees.
     # Train: sampled per window around the mean. Val/test: the mean, no noise.
@@ -39,7 +56,7 @@ data:
         pos_std: [0.015, 0.015, 0.015]
         rot_std_deg: [25.0, 25.0, 25.0]
   batch_size: 256
-  num_workers: 4
+  num_workers: 8
   fps: 60.0
 
 model:
@@ -50,14 +67,14 @@ model:
 
 training:
   lr: 1.0e-4
-  epochs: 200
-  scheduler_milestones: [15, 30, 45, 60, 90, 120]
+  epochs: 80                    # x 2M windows = 160M samples
+  scheduler_milestones: [45, 60, 70]
   scheduler_gamma: 0.5
   grad_clip: 0.5
   lambda_pos: 5.0
   lambda_rot: 0.5
   lambda_vel: 0.1
-  save_dir: ../checkpoints_v2
+  save_dir: ../checkpoints_mix
   log_interval: 50
   val_interval: 1
 

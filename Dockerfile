@@ -47,7 +47,9 @@ RUN pip3 install --no-cache-dir \
     scipy \
     tqdm \
     PyYAML \
-    wandb
+    wandb \
+    pandas \
+    pyarrow
 
 # Enable color terminal and source ROS2
 ENV TERM=xterm-256color

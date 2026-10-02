@@ -1,71 +1,17 @@
 """
-Transformer-based full-body pose estimator (v3).
+Transformer pose estimator: 6 tracker poses -> 22 SMPL joint rotations -> joint positions.
 
-Key changes from v2:
-- Lightweight SkeletalFK replaces full SMPL model
-  → No axis-angle conversion (eliminates 180° singularity)
-  → ~100x less VRAM (pure matmul + add, no mesh skinning)
-  → Fully differentiable by construction
-- 6D rotation output (continuous, Gram-Schmidt)
-- Many-to-many with causal RoPE Transformer
+A causal RoPE transformer encoder reads a window of tracker features and predicts one
+6D rotation per joint and frame. Rotations are made orthonormal (Gram-Schmidt), chained
+into global rotations, and passed through forward kinematics with the body's bone
+offsets, so positions are a differentiable function of the predicted rotations.
 """
 
 import torch
 import torch.nn as nn
 
-from .skeleton import SMPL_PARENTS, fk_positions
-
-
-# ─── T-pose bone offsets (extracted from SMPL neutral) ────────────
-# These are constant — child_joint - parent_joint in T-pose (Y-up).
-# The dataset converts to Z-up, but bone offsets are in SMPL's
-# native space since FK operates in local frames.
-
-SMPL_BONE_OFFSETS_22 = [
-    [-0.001795, -0.223333, 0.028219],  # 0  Pelvis (root)
-    [0.069520, -0.091406, -0.006815],  # 1  L_Hip
-    [-0.067670, -0.090522, -0.004320],  # 2  R_Hip
-    [-0.002533, 0.108963, -0.026696],  # 3  Spine1
-    [0.034277, -0.375199, -0.004496],  # 4  L_Knee
-    [-0.038290, -0.382569, -0.008850],  # 5  R_Knee
-    [0.005487, 0.135180, 0.001092],  # 6  Spine2
-    [-0.013596, -0.397960, -0.043693],  # 7  L_Ankle
-    [0.015774, -0.398415, -0.042312],  # 8  R_Ankle
-    [0.001457, 0.052922, 0.025425],  # 9  Spine3
-    [0.026358, -0.055791, 0.119288],  # 10 L_Foot
-    [-0.025372, -0.048144, 0.123348],  # 11 R_Foot
-    [-0.002778, 0.213870, -0.042857],  # 12 Neck
-    [0.078845, 0.121749, -0.034090],  # 13 L_Collar
-    [-0.081759, 0.118833, -0.038615],  # 14 R_Collar
-    [0.005152, 0.064970, 0.051349],  # 15 Head
-    [0.090977, 0.030469, -0.008868],  # 16 L_Shoulder
-    [-0.096012, 0.032551, -0.009143],  # 17 R_Shoulder
-    [0.259612, -0.012772, -0.027456],  # 18 L_Elbow
-    [-0.253742, -0.013329, -0.021401],  # 19 R_Elbow
-    [0.249234, 0.008986, -0.001171],  # 20 L_Wrist
-    [-0.255298, 0.007772, -0.005559],  # 21 R_Wrist
-]
-
-
-# ─── 6D Rotation Utilities ────────────────────────────────────────
-
-
-def sixd_to_rotmat(sixd):
-    """
-    6D rotation → 3×3 rotation matrix via Gram-Schmidt.
-    sixd: [..., 6] → [..., 3, 3]
-    """
-    a1, a2 = sixd[..., :3], sixd[..., 3:]
-    b1 = nn.functional.normalize(a1, dim=-1)
-    dot = (b1 * a2).sum(dim=-1, keepdim=True)
-    b2 = nn.functional.normalize(a2 - dot * b1, dim=-1)
-    b3 = torch.cross(b1, b2, dim=-1)
-    return torch.stack([b1, b2, b3], dim=-1)
-
-
-def rotmat_to_sixd(rotmat):
-    """[...,3,3] → [...,6] first two columns."""
-    return torch.cat([rotmat[..., :, 0], rotmat[..., :, 1]], dim=-1)
+from .rotations import sixd_to_rotmat
+from .skeleton import SMPL_NEUTRAL_OFFSETS, SMPL_PARENTS, fk_positions
 
 
 # ─── Lightweight Skeletal FK ──────────────────────────────────────
@@ -73,30 +19,14 @@ def rotmat_to_sixd(rotmat):
 
 class SkeletalFK(nn.Module):
     """
-    Pure PyTorch skeletal forward kinematics.
-
-    Computes global joint positions from the kinematic chain.
-    Accepts pre-computed global_rotmats to avoid redundant
-    chain computation when global rotations are already known.
-
-    Memory: O(22 * B) vs SMPL's O(6890_vertices * B)
+    Forward kinematics from global joint rotations (see skeleton.fk_positions).
+    Holds the neutral SMPL skeleton as the default body; pass per-sample offsets
+    to use a different one.
     """
 
     def __init__(self):
         super().__init__()
-        # 1. Base offsets in SMPL Y-up space
-        offsets_yup = torch.tensor(SMPL_BONE_OFFSETS_22, dtype=torch.float32)
-
-        # 2. Convert to project Z-up convention
-        # H maps Y-up to Z-up: X->Y, Y->Z, Z->X
-        H = torch.tensor([
-            [0, 0, 1],
-            [1, 0, 0],
-            [0, 1, 0],
-        ], dtype=torch.float32)
-        offsets_zup = torch.einsum("ij,nj->ni", H, offsets_yup)
-
-        self.register_buffer("bone_offsets", offsets_zup)
+        self.register_buffer("bone_offsets", torch.tensor(SMPL_NEUTRAL_OFFSETS, dtype=torch.float32))
 
     def forward(self, global_rotmats, offsets=None):
         """
@@ -220,13 +150,8 @@ class RoPETransformerEncoderLayer(nn.Module):
 
 class TransformerBodyPose(nn.Module):
     """
-    Transformer encoder for VR full-body pose estimation (v3).
-
-    Input:  [B, W, input_dim]
-    Output: local_rotmats [B,W,22,3,3], global_rotmats, fk_pos
-
-    Uses SkeletalFK instead of SMPL — no axis-angle conversion,
-    no mesh skinning, ~100x less VRAM, fully differentiable.
+    Input:  [B, W, input_dim]  (6 trackers x pos3 + 6D rot + their velocities = 108)
+    Output: local_rotmats [B,W,22,3,3], global_rotmats [B,W,22,3,3], fk_pos [B,W,22,3]
     """
 
     def __init__(

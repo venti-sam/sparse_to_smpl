@@ -1,12 +1,12 @@
 """
-Training script v4 for VR full-body pose estimation.
+Train the sparse-to-dense pose estimator on the mixed motion store.
 
-Key upgrades:
-- AdamW with weight decay decoupling (safe for LayerNorm)
-- Step-based learning rate warmup for large Transformers
-- Non-blocking async GPU memory transfers
-- Corrected weighted batch averaging for validation metrics
-- Full resume logic including GradScaler states
+    python3 -m tcn.train [--config tcn/config.yaml] [--resume CKPT] [--epochs N]
+                         [--run-name NAME] [--save-dir DIR]
+
+AdamW (no weight decay on norms/biases), linear warmup then step decay, mixed
+precision. Every validation set is scored each epoch; the best checkpoint by mean
+validation loss is saved and scored once on the test sets at the end. Logs to wandb.
 """
 
 import os
@@ -37,15 +37,15 @@ def train(cfg):
     wandb.init(
         project=cfg["wandb"]["project"],
         entity=cfg["wandb"].get("entity"),
+        name=cfg["wandb"].get("name"),
         config=cfg,
     )
 
     # ── Data ──
-    train_loader, val_loader, test_loader = create_dataloaders(cfg)
+    train_loader, val_loaders, test_loaders = create_dataloaders(cfg)
     print(
-        f"Train: {len(train_loader.dataset)} windows, "
-        f"Val: {len(val_loader.dataset)} windows, "
-        f"Test: {len(test_loader.dataset) if test_loader else 0} windows"
+        f"Train: {len(train_loader.dataset)} windows/epoch | "
+        + " | ".join(f"{n}: {len(loader.dataset)} windows" for n, loader in {**val_loaders, **test_loaders}.items())
     )
 
     # ── Model ──
@@ -203,13 +203,18 @@ def train(cfg):
         for k in epoch_losses:
             epoch_losses[k] /= max(num_batches, 1)
 
-        # ── Validation ──
+        # ── Validation (every val set; model selection on their mean loss) ──
         if (epoch + 1) % val_interval == 0:
-            val_loss, val_mpjpe = validate(model, val_loader, criterion, device)
+            per_set = {n: validate(model, loader, criterion, device) for n, loader in val_loaders.items()}
+            val_loss = {k: sum(r[0][k] for r in per_set.values()) / len(per_set) for k in next(iter(per_set.values()))[0]}
+            val_mpjpe = sum(r[1] for r in per_set.values()) / len(per_set)
 
             log = {"epoch": epoch + 1}
             for k, v in val_loss.items():
                 log[f"val/{k}"] = v
+            for n, (ls, mp) in per_set.items():
+                log[f"val/{n}/mpjpe_mm"] = mp
+                log[f"val/{n}/total"] = ls["total"]
             for k, v in epoch_losses.items():
                 log[f"train/{k}"] = v
             log["val/mpjpe_mm"] = val_mpjpe
@@ -220,8 +225,8 @@ def train(cfg):
                 f"Epoch {epoch+1:3d} | "
                 f"train={epoch_losses.get('total', 0):.4f} | "
                 f"val={val_loss.get('total', 0):.4f} | "
-                f"mpjpe={val_mpjpe:.1f}mm | "
-                f"lr={scheduler.get_last_lr()[0]:.2e}"
+                + " ".join(f"{n}={mp:.1f}mm" for n, (_, mp) in per_set.items())
+                + f" | lr={scheduler.get_last_lr()[0]:.2e}"
             )
 
             if val_loss.get("total", float("inf")) < best_val_loss:
@@ -253,23 +258,17 @@ def train(cfg):
                 os.path.join(save_dir, f"checkpoint_epoch{epoch+1}.pt"),
             )
 
-    # ── Held-out test: best-by-val checkpoint, evaluated once ──
+    # ── Held-out test sets: best-by-val checkpoint, evaluated once ──
     best_path = os.path.join(save_dir, "best_model.pt")
-    if test_loader is not None and os.path.exists(best_path):
+    if test_loaders and os.path.exists(best_path):
         best = torch.load(best_path, map_location=device)
         model.load_state_dict(best["model_state_dict"])
-        test_loss, test_mpjpe = validate(model, test_loader, criterion, device)
-        wandb.log(
-            {
-                **{f"test/{k}": v for k, v in test_loss.items()},
-                "test/mpjpe_mm": test_mpjpe,
-                "test/best_epoch": best["epoch"],
-            }
-        )
-        print(
-            f"\nTest (best model, epoch {best['epoch']}): "
-            f"loss={test_loss.get('total', 0):.4f} | mpjpe={test_mpjpe:.1f}mm"
-        )
+        print(f"\nTest (best model, epoch {best['epoch']}):")
+        for n, loader in test_loaders.items():
+            test_loss, test_mpjpe = validate(model, loader, criterion, device)
+            wandb.log({**{f"test/{n}/{k}": v for k, v in test_loss.items()},
+                       f"test/{n}/mpjpe_mm": test_mpjpe, "test/best_epoch": best["epoch"]})
+            print(f"  {n:12s} loss={test_loss.get('total', 0):.4f} | mpjpe={test_mpjpe:.1f}mm")
 
     wandb.finish()
     print(f"\nDone. Best val_loss: {best_val_loss:.4f}")
@@ -334,10 +333,19 @@ if __name__ == "__main__":
         default=None,
         help="Path to checkpoint .pt file to resume from",
     )
+    parser.add_argument("--epochs", type=int, default=None, help="override training.epochs")
+    parser.add_argument("--run-name", type=str, default=None, help="wandb run name")
+    parser.add_argument("--save-dir", type=str, default=None, help="override training.save_dir")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     if args.resume:
         cfg["resume"] = args.resume
+    if args.epochs:
+        cfg["training"]["epochs"] = args.epochs
+    if args.run_name:
+        cfg["wandb"]["name"] = args.run_name
+    if args.save_dir:
+        cfg["training"]["save_dir"] = args.save_dir
 
     train(cfg)

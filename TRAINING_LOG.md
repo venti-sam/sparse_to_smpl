@@ -90,3 +90,16 @@ This document tracks the architectural refactoring, optimization, and training s
 * **Issue:** Randomly splitting sequences into Train/Val/Test risks "data leakage," where the model memorizes specific lab-related biases or actor-specific motions rather than learning general human kinematics.
 * **Fix:** Implemented a prefix-based filename system during extraction (e.g., `CMU_seq_00001.pt`). Updated `config.yaml` and `dataset.py` to support explicit folder-based splits (e.g., training on CMU and KIT, validating on SFU). This provides a "Gold Standard" test of cross-dataset generalization.
 * **Verified Folders:** Confirmed successful processing of newly added datasets: `BMLmovi`, `BMLrub`, `CMU`, `HDM05`, `KIT`, `PosePrior`, `SFU`, `SSM`.
+
+## 7. Data fixes and BONES-SEED (Oct 2026)
+
+The 100 mm and later 24 mm plateaus were partly data problems, not model problems.
+
+- **Up-axis bug.** AMASS joints are already Z-up, but the v1 extraction applied a second Y-up to Z-up permutation, so the stored data had X as its up axis. Heading canonicalization (yaw about Z) then tipped the body over: only 1.3% of validation windows ended up upright, and 28% had a degenerate heading. `convert_dataset_v2.py` undoes it (92.9% upright afterwards). A v1-trained model scored 28.2 mm on its own convention but 33.8 mm on true Z-up input, which is what the live pipeline feeds it.
+- **Neutral skeleton.** FK used one neutral skeleton against per-actor ground truth, a 25.7 mm mean error floor (up to 55 mm). Training now uses per-actor bone offsets, with random body-size scaling.
+- **Tracker model.** Trackers were exact joint copies. They are now mounted like real Vive trackers (belt buckle, shin strap, HMD, stick-held controllers) with jitter and short dropouts.
+- **BONES-SEED.** 71k clips (144 h, 522 actors) are converted to the same form by `convert_bvh_v2.py`, using the SMPL neutral body: LAFAN1 scored 68 mm on its own skeleton but 34 mm on the SMPL body. Mirrored clips are exact reflections (0.4 deg), so they are skipped and mirroring is done on the fly. An AMASS-only model overfit after about 12 passes (val minimum epoch 12) and was 14 mm worse on unseen BONES actors than a 2-epoch AMASS+BONES mix.
+- **Training pipeline.** All datasets live in one memory-mapped store; workers slice raw windows and the tracker simulation runs on the GPU (a loader that shipped pre-built batches was 7x slower and overflowed Docker's 64 MB /dev/shm).
+
+AMASS-only baseline (best epoch 12): AMASS val 23.8 mm, SSM test 23.5 mm, unseen BONES 32.2 mm, LAFAN1 32.5 mm. Mixed run, 2 epochs: 24.9 / 24.5 / 18.4 / 29.2 mm.
+

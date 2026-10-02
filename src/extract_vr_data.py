@@ -4,7 +4,9 @@ import torch
 import numpy as np
 from tqdm import tqdm
 import smplx
-from scipy.spatial.transform import Rotation as R
+
+from tcn.skeleton import SMPL_PARENTS
+from tcn.trackers import TRACKER_JOINTS
 
 # ---------------------------------------------------------
 # 1. CONSTANTS & CONFIGURATION
@@ -15,55 +17,9 @@ BODY_MODEL_PATH = "../support_data/body_models/smplh/neutral/model_clean.pkl"
 AMASS_DIR = "../support_data/amass_npz"
 OUTPUT_DIR = "../support_data/vr_teleop_dataset"
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Standard 22-joint SMPL kinematic tree (Parents array)
-SMPL_PARENTS = [
-    -1,
-    0,
-    0,
-    0,
-    1,
-    2,
-    3,
-    7,
-    8,
-    9,
-    10,
-    #  0  1  2  3  4  5  6  7  8  9  10
-    # pel Lh Rh sp Lk Rk sp2 La Ra sp3 nk
-    # Note: indices 7,8 are L/R ankle, 9 is spine3, 10 is neck
-]
-
-# Full 22-joint SMPL parent indices
-SMPL_PARENTS = [
-    -1,  # 0  Pelvis
-    0,  # 1  L_Hip
-    0,  # 2  R_Hip
-    0,  # 3  Spine1
-    1,  # 4  L_Knee
-    2,  # 5  R_Knee
-    3,  # 6  Spine2
-    4,  # 7  L_Ankle
-    5,  # 8  R_Ankle
-    6,  # 9  Spine3
-    7,  # 10 L_Foot
-    8,  # 11 R_Foot
-    9,  # 12 Neck
-    9,  # 13 L_Collar
-    9,  # 14 R_Collar
-    12,  # 15 Head
-    13,  # 16 L_Shoulder
-    14,  # 17 R_Shoulder
-    16,  # 18 L_Elbow
-    17,  # 19 R_Elbow
-    18,  # 20 L_Wrist
-    19,  # 21 R_Wrist
-]
-
-# 6 VR Tracker joints mapped to SMPL joint indices
-# pelvis, L_Ankle, R_Ankle, Head, L_Wrist, R_Wrist
-TRACKER_IDX = [0, 7, 8, 15, 20, 21]
+# 6 VR tracker joints (pelvis, L_Ankle, R_Ankle, Head, L_Wrist, R_Wrist)
+TRACKER_IDX = TRACKER_JOINTS
 
 # Body part names (matching GMR human_data keys)
 TRACKER_NAMES = [
@@ -136,17 +92,6 @@ def rotmats_y_to_z(rotmats):
     return H @ rotmats @ H.T
 
 
-# Note: rotmats_to_quat_wxyz is no longer used for saving, but kept for reference if needed
-def rotmats_to_quat_wxyz(rotmats_np):
-    """Convert rotation matrices [..., 3, 3] to quaternions [..., 4] in [w,x,y,z]."""
-    orig_shape = rotmats_np.shape[:-2]
-    flat = rotmats_np.reshape(-1, 3, 3)
-    quats = R.from_matrix(flat).as_quat()  # scipy returns [x,y,z,w]
-    # Reorder to [w,x,y,z] (scalar-first, matching GMR convention)
-    quats = quats[:, [3, 0, 1, 2]]
-    return quats.reshape(orig_shape + (4,))
-
-
 # ---------------------------------------------------------
 # 3. HELPER: AXIS-ANGLE → ROTATION MATRIX (Rodrigues)
 # ---------------------------------------------------------
@@ -207,7 +152,9 @@ def compute_bone_offsets(bm, betas):
     The root row is the pelvis joint itself (unused by root-relative FK).
     """
     n = betas.shape[0]
-    zeros = lambda *s: torch.zeros(*s, device=betas.device, dtype=betas.dtype)
+    def zeros(*shape):
+        return torch.zeros(*shape, device=betas.device, dtype=betas.dtype)
+
     body = bm(
         betas=betas,
         body_pose=zeros(n, 69),
@@ -226,6 +173,7 @@ def compute_bone_offsets(bm, betas):
 # 5. MAIN EXTRACTION ROUTINE
 # ---------------------------------------------------------
 def extract_dataset():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     print("Loading SMPL Body Model via smplx...")
     bm = smplx.SMPL(
         model_path=BODY_MODEL_PATH,

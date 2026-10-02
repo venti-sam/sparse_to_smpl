@@ -5,7 +5,6 @@ import time
 
 try:
     import rclpy
-    from rclpy.node import Node
     from visualization_msgs.msg import Marker, MarkerArray
     from geometry_msgs.msg import Point
 except ImportError:
@@ -16,8 +15,11 @@ except ImportError:
     print("Ensure you have sourced '/opt/ros/humble/setup.bash'.")
     exit(1)
 
-from tcn.dataset import VRTeleopDataset, SMPL_PARENTS
-from tcn.model import TransformerBodyPose, sixd_to_rotmat
+from tcn.dataset import make_eval_dataset
+from tcn.gpu_aug import GPUSampleBuilder
+from tcn.model import TransformerBodyPose
+from tcn.rotations import sixd_to_rotmat
+from tcn.skeleton import SMPL_PARENTS
 from tcn.train import load_config
 
 
@@ -143,21 +145,10 @@ def main(args):
     model.eval()
     print("Model loaded successfully.")
 
-    # ── Dataset (Test Set) ──
-    # Set stride = window_size to play sequences continuously without overlap
+    # ── Test windows: consecutive, non-overlapping, from one test set of the config ──
     W = cfg["data"]["window_size"]
-    test_folders = cfg["data"].get("test_folders")
-    
-    dataset = VRTeleopDataset(
-        dataset_dir=cfg["data"]["dataset_dir"],
-        window_size=W,
-        stride=W,
-        split="test",
-        train_ratio=cfg["data"]["train_split"],
-        folders=test_folders,
-        augmentation=cfg["data"].get("augmentation"),  # nominal tracker mount only
-    )
-    print(f"Test dataset loaded with {len(dataset)} windows (folders={test_folders}).")
+    dataset = make_eval_dataset(cfg, cfg["data"]["test"][args.test_set], stride=W, label=args.test_set)
+    builder = GPUSampleBuilder(cfg["data"].get("augmentation"), device)  # nominal tracker mount, no noise
 
     # Frame rate delay
     fps = cfg["data"].get("fps", 60.0)
@@ -173,16 +164,12 @@ def main(args):
         if not rclpy.ok():
             break
 
-        batch = dataset[idx]
-        # Add batch dimension [1, W, ...]
-        inputs = batch["input"].unsqueeze(0).to(device)
-        gt_pos = batch["target_pos"].unsqueeze(0).to(device)
+        raw = {k: v[None] for k, v in dataset[idx].items() if k != "seq_id"}
+        batch = builder(raw, train=False)  # batch of one, built on the GPU
+        inputs, gt_pos = batch["input"], batch["target_pos"]
 
-        # Forward pass
         with torch.amp.autocast("cuda"):
-            _, global_rotmats, fk_pos = model(
-                inputs, bone_offsets=batch["bone_offsets"].unsqueeze(0).to(device)
-            )
+            _, global_rotmats, fk_pos = model(inputs, bone_offsets=batch["bone_offsets"])
 
         # `fk_pos` and `global_rotmats` are root-relative/absolute
         # Center the prediction properly
@@ -194,19 +181,8 @@ def main(args):
         pred_rot_seq = global_rotmats[0].cpu().numpy()
         gt_seq = gt_pos[0].cpu().numpy()
 
-        # Inputs include tracker_rotmat [B, W, 6, 3, 3] in project Z-up convention
-        # We need to unflatten the tracker data if it was flattened? 
-        # The dataset returns "input" as [W, 108].
-        # 108 = 6 trackers * (3 pos + 6 rot + 3 vel_pos + 6 vel_rot)
-        # tracker_rotmat is at indices [3:9] for each tracker (6D representation)
-        # However, it's easier to just use the raw tracker data if available.
-        # Let's check VRTeleopDataset again. It returns "input".
-        # Actually, let's modify the dataset to return raw tracker rotmats for debug viz.
-        
-        # For now, let's assume we want to visualize the predicted orientations on the skeleton.
-        # Extract input tracker poses for visualization
-        # inputs: [1, W, 108]
-        # each tracker: [pos(3), sixd(6), vel_pos(3), vel_sixd(6)]
+        # Tracker poses for the axis arrows: per tracker the 18 input features are
+        # pos(3), 6D rotation(6), pos velocity(3), rot velocity(6)
         in_np = inputs[0].cpu()
         tracker_viz_pos = []
         tracker_viz_rot = []
@@ -304,5 +280,6 @@ if __name__ == "__main__":
         type=str,
         default=os.path.join(os.path.dirname(__file__), "tcn", "config.yaml"),
     )
+    parser.add_argument("--test-set", default="amass_test", help="a key of data.test in the config")
     args = parser.parse_args()
     main(args)
