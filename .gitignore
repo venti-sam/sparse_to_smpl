@@ -142,3 +142,6 @@ all_data_ckpt/
 wandb/
 repomix-output.xml
 .vscode/
+
+# Clips exported from the Vive pipeline (htc_vive_pro2_socket/docker_scripts/sync_exports.sh)
+exports/
