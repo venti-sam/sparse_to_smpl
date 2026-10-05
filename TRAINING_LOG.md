@@ -103,3 +103,60 @@ The 100 mm and later 24 mm plateaus were partly data problems, not model problem
 
 AMASS-only baseline (best epoch 12): AMASS val 23.8 mm, SSM test 23.5 mm, unseen BONES 32.2 mm, LAFAN1 32.5 mm. Mixed run, 2 epochs: 24.9 / 24.5 / 18.4 / 29.2 mm.
 
+## 8. Mixed run (80 epochs) and last-frame check (Oct 2 2026)
+
+The model is not a TCN. The `tcn/` package name is a leftover from the first version (see section 1): `model.py` is a 6-layer causal RoPE transformer (512 wide, 8 heads, 19.3M parameters) over a 40-frame window at 60 Hz. The plateaus above were data problems, so an architecture swap (TCN, GRU) is not expected to move the numbers by more than a few mm.
+
+Run `x6d7gh1n` (AMASS 40% / BONES standing 30% / BONES low-pose 30%, 2M windows per epoch, 80 epochs, 07:23 to about 13:50 UTC, about 5 min per epoch). It finished cleanly and the best checkpoint is the last epoch. Validation MPJPE:
+
+| epoch | train loss | val loss | amass_val | bones_val |
+|---|---|---|---|---|
+| 1 | 0.2011 | 0.1051 | 28.8 mm | 19.8 mm |
+| 2 | 0.1191 | 0.0984 | 26.8 mm | 18.1 mm |
+| 3 | 0.1122 | 0.0964 | 26.0 mm | 18.0 mm |
+| 8 | 0.0999 | 0.0936 | 25.9 mm | 17.2 mm |
+| 9 | 0.0930 | 0.0739 | 22.9 mm | 16.6 mm |
+| 22 | 0.0705 | 0.0695 | 21.9 mm | 15.5 mm |
+| 45 | 0.0644 | 0.0688 | 21.8 mm | 15.3 mm |
+| 80 | 0.0599 | 0.0675 | 21.4 mm | 14.9 mm |
+
+The earlier 2-epoch mixed run (`fev6ooak`) had 25.9 / 20.0 mm at epoch 1 and 24.9 / 18.4 mm at epoch 2, so this run is slightly behind on AMASS early on, within epoch-1 noise.
+
+- **Step at epoch 9.** Val loss fell from 0.0936 to 0.0739 in one epoch and train loss dropped with it (0.0999 to 0.0930 to 0.0820). It looks like a phase transition; cause not investigated.
+- **Plateau and LR decay.** Val loss was flat at 0.0685-0.0694 from about epoch 28 while train kept falling. Each LR halving (epochs 45, 60, 70) gave a small step; the first was the largest (val 0.0694 at epoch 44 to 0.0679 at epoch 46). The last 35 epochs improved val loss by about 0.001 and AMASS val by 0.4 mm, so the run could have stopped near epoch 50 and saved about 2.5 h. Val never rose, so there is no overfitting; the final train/val gap (0.0599 vs 0.0675) is partly train-only augmentation.
+- **Checkpoints.** `checkpoints_mix/` holds `checkpoint_epoch{10..80}.pt` and `best_model.pt` (identical to epoch 80).
+
+Final test scores (best model, MPJPE, root-relative), against the earlier baselines from section 7:
+
+| test set | this run (80 ep) | 2-epoch mix | AMASS-only |
+|---|---|---|---|
+| amass_test (SSM) | 20.2 mm | 24.5 | 23.5 |
+| bones_test (unseen actors) | 15.9 mm | 18.4 | 32.2 |
+| lafan1 | 25.5 mm | 29.2 | 32.5 |
+
+Longer training on the mix improved every set by 2.5-4.3 mm over the 2-epoch mix. Per-joint error at the last frame (checkpoint epoch 80, 8192 random windows per set): elbows are the worst joints on AMASS and BONES (30-43 mm), then feet (25-32 mm) and wrists (22-35 mm); on LAFAN1 the feet are the worst (48-50 mm). Elbows are not tracked and their swivel is underdetermined by hand and head poses, which is the likely reason. The LAFAN1 foot error probably comes from the BVH-to-SMPL foot geometry (section 7), but that is a guess.
+
+**Train/deploy frame check.** Training and validation average the loss and MPJPE over all 40 output frames, but the live estimator (`htc_vive_pro2_socket/.../estimator.py`) uses only the last one (`fk_pos[0, -1]`). The suspicion was that early frames, which have little causal context, make the reported mm optimistic. Measured on the epoch-3 best checkpoint (4096 random val windows per set, MPJPE by frame position):
+
+| set | all-frame mean | last frame | frames >= 20 | frame 0 |
+|---|---|---|---|---|
+| amass_val | 26.0 mm | 26.0 | 25.8 | 28.3 |
+| bones_val | 18.0 mm | 17.8 | 17.8 | 19.9 |
+| lafan1 | 28.6 mm | 29.6 | 28.8 | 31.4 |
+
+- The suspicion was mostly wrong. Error is nearly flat across the window; only frames 0-2 are 2-3 mm worse. Velocity features and window-start heading canonicalization give even early frames enough to go on, so the all-frame mean tracks the deployed number to within 0.2 mm on AMASS and BONES (1.0 mm on LAFAN1). No loss reweighting is needed.
+- At epoch 3, LAFAN1 was the exception: its error grew with context (28.0 mm at frame 9, 29.6 mm at frame 39). In the final model this is nearly gone (25.4 mm at frame 9, 25.8 mm at frame 39), so it was an early-training effect, not a standing problem.
+- Live pipeline settings match training (`window_size: 40`, `fps: 60.0`).
+
+Re-measured on the final checkpoint (epoch 80, 8192 random windows per set, 199 for amass_test); the conclusion holds, error is flat across the window and the last frame is as good as or better than the mean:
+
+| set | all-frame mean | last frame | frame 0 |
+|---|---|---|---|
+| amass_val | 21.4 mm | 21.2 | 21.9 |
+| bones_val | 14.9 mm | 14.6 | 15.6 |
+| amass_test | 20.2 mm | 19.6 | 21.1 |
+| bones_test | 15.8 mm | 15.5 | 16.2 |
+| lafan1 | 25.6 mm | 25.8 | 25.5 |
+
+Ideas not yet tried: a shorter schedule (the run was flat after about epoch 50; e.g. 50 epochs with the first LR drop around epoch 30); log a `last_mm` metric in `validate()` so the selection number is the deployment number; a mild loss ramp (weight 0.5 on frames 0-9, 1.0 after), which the final curve shows is unnecessary; a longer window (90-120 frames, within the 512-frame RoPE limit) for ambiguous poses such as sitting versus standing, judged on last-frame error.
+
