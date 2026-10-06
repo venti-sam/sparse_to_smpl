@@ -2,6 +2,14 @@
 
 Sparse-to-dense body pose for VR teleoperation: a causal transformer that predicts a full 22-joint SMPL body from 6 VR trackers (pelvis, both ankles, head, both hands). It is trained on motion capture (AMASS and BONES-SEED) with simulated Vive trackers, and feeds the live pipeline in `htc_vive_pro2_socket`, which retargets the body to the G1.
 
+> **This repo only trains the model.** It has no runtime role in the pipeline. Inference runs in
+> `htc_vive_pro2_socket` (branch `offline_dense_gmr`, package `src/skeletal_dense`), which carries a
+> copy of `src/tcn/model.py`. Hand a trained model over with, on the host,
+> `htc_vive_pro2_socket/docker_scripts/sync_exports.sh model [checkpoints_mix/best_model.pt]`: it
+> snapshots the checkpoint and checks that it loads into that copy. If you change the architecture
+> here, update the copy (and the dims in its `estimator.py`) too. Pipeline map: the `main` branch
+> README of `htc_vive_pro2_socket`.
+
 Everything below runs **inside the Docker container** from `/workspace/amass/src` unless noted. (The image and container keep their original names `amass_env` / `amass_container`, and the repo is mounted at `/workspace/amass` inside it.)
 
 ## 0. Prerequisites
@@ -77,19 +85,22 @@ python3 infer_rviz.py --checkpoint ../checkpoints_mix/best_model.pt [--test-set 
 
 Green = prediction, red = ground truth (offset 1 m in X). `--test-set` is a key of `data.test` in the config (default `amass_test`).
 
-## 5. Deploy to the live pipeline
+## 5. Hand the model to the pipeline
 
 ```bash
-# host
-cp checkpoints_mix/best_model.pt ~/Projects/htc_vive_pro2_socket/src/skeletal_dense/checkpoints/<name>.pt
+# host: snapshot into htc_vive_pro2_socket/src/skeletal_dense/checkpoints/ and test-load it there
+~/Projects/htc_vive_pro2_socket/docker_scripts/sync_exports.sh model checkpoints_mix/best_model.pt [name]
 ```
 
-Then launch `skeletal_dense` with `checkpoint:=<that file>` (see the `htc_vive_pro2_socket` README). A v2-trained model already includes the tracker mounting, so set `pelvis_offset`, `ankle_offset` and `ankle_drop` to `0` in `skeletal_dense.launch.py`.
+Then pass that file as `--checkpoint` to `bag_export` (offline clips for TWIST) or as `checkpoint:=` to
+`skeletal_dense` / `offline_gmr.launch.py` (see the `offline_dense_gmr` README of `htc_vive_pro2_socket`).
+A v2-trained model already includes the tracker mounting, so its `pelvis_offset`, `ankle_offset` and
+`ankle_drop` stay `0` (the defaults).
 
 ## Notes
 
 - Frame: **Z-up, X forward**. Checkpoints trained on v1 data (including `all_data_ckpt/best_model.pt`) used X-up and are **not** compatible with v2 data or `infer_rviz.py`; they stay usable only in the old live pipeline.
-- `all_data_ckpt/best_model.pt` is the currently deployed (v1) model.
+- The pipeline uses the v2 model `v2_best.pt` (the 80-epoch mixed run). `all_data_ckpt/best_model.pt` is the old v1 model.
 - Training history and past debugging: `TRAINING_LOG.md`.
 
 ## Layout
