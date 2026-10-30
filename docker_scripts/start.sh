@@ -8,6 +8,12 @@ DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
 echo "Building amass_env docker image..."
 docker build -t amass_env "$DIR"
 
+# support_data (and other bulk data) is a symlink into ~/data, so the container must see ~/data at the same path
+DATA_MOUNT=()
+if [ -d "$HOME/data" ]; then
+    DATA_MOUNT=(-v "$HOME/data:$HOME/data")
+fi
+
 # Run the docker container in detached mode
 echo "Starting amass_env container..."
 docker rm -f amass_container || true
@@ -20,6 +26,7 @@ docker run -d --name amass_container \
     -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
     --network host \
     -v "$DIR":/workspace/amass \
+    "${DATA_MOUNT[@]}" \
     -w /workspace/amass \
     amass_env
 
